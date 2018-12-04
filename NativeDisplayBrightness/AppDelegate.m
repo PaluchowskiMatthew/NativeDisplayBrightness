@@ -7,15 +7,32 @@
 //
 
 #import "AppDelegate.h"
-#import "DDC.h"
 #import "BezelServices.h"
 #import "OSD.h"
 #include <dlfcn.h>
+
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <sys/kern_control.h>
+#include <sys/sys_domain.h>
+#include <sys/kern_event.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+
+
+static const int kCommandSetBrightness = 1;
+static const char* kCtlName = "github.com.TankTheFrank.nvdagpuhandler";
+
 @import Carbon;
 
 #pragma mark - constants
 
 static NSString *brightnessValuePreferenceKey = @"brightness";
+static const int MIN_BRIGHTNESS = 50;
+static const int MAX_BRIGHTNESS = 900;
 static const float brightnessStep = 100/16.f;
 
 #pragma mark - variables
@@ -24,33 +41,91 @@ void *(*_BSDoGraphicWithMeterAndTimeout)(CGDirectDisplayID arg0, BSGraphic arg1,
 
 #pragma mark - functions
 
-void set_control(CGDirectDisplayID cdisplay, uint control_id, uint new_value)
+CGEventRef keyboardCGEventCallback(CGEventTapProxy proxy,
+                                   CGEventType type,
+                                   CGEventRef event,
+                                   void *refcon)
 {
-    struct DDCWriteCommand command;
-    command.control_id = control_id;
-    command.new_value = new_value;
+    if (type != NX_SYSDEFINED)
+        return event;
     
-    if (!DDCWrite(cdisplay, &command)){
-        NSLog(@"E: Failed to send DDC command!");
+    NSEvent* keyEvent = [NSEvent eventWithCGEvent: event];
+    if (keyEvent.type != NSEventTypeSystemDefined || keyEvent.subtype != 8)
+        return event;
+    
+    int keyCode = (([keyEvent data1] & 0xFFFF0000) >> 16);
+    int keyFlags = ([keyEvent data1] & 0x0000FFFF);
+    int keyState = (((keyFlags & 0xFF00) >> 8)) == 0xA;
+    
+    // Ignore everything except brightness
+    if (keyCode != NX_KEYTYPE_BRIGHTNESS_DOWN && keyCode != NX_KEYTYPE_BRIGHTNESS_UP)
+        return event;
+    
+    // don't handle key up
+    if (keyState == 0)
+        return NULL;
+    
+    // we receive twice the same event so we need to check delay so we ignore everything less than 10 ms
+    static struct timeval lastEvent = {0, 0};
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    if (now.tv_sec * 1000 + now.tv_usec/1000 - lastEvent.tv_sec * 1000 - lastEvent.tv_usec/1000 < 10)
+        return NULL;
+    
+    lastEvent = now;
+    
+    // handle the brightness change
+    switch (keyCode)
+    {
+        case NX_KEYTYPE_BRIGHTNESS_DOWN:
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [(__bridge AppDelegate*)refcon decreaseBrightness];
+            });
+            break;
+        case NX_KEYTYPE_BRIGHTNESS_UP:
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [(__bridge AppDelegate*)refcon increaseBrightness];
+            });
+            break;
+        default:
+            break;
     }
+    
+    return NULL;
 }
 
 
-CGEventRef keyboardCGEventCallback(CGEventTapProxy proxy,
-                             CGEventType type,
-                             CGEventRef event,
-                             void *refcon)
+int connectKextSocket()
 {
-    //Surpress the F1/F2 key events to prevent other applications from catching it or playing beep sound
-    if (type == NX_KEYDOWN || type == NX_KEYUP || type == NX_FLAGSCHANGED)
-    {
-        int64_t keyCode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
-        if (keyCode == kVK_F2 || keyCode == kVK_F1)
-        {
-            return NULL;
-        }
+    int fd = socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL);
+    
+    /* get the utun control id */
+    struct ctl_info info;
+    memset(&info, 0, sizeof(info));
+    strncpy(info.ctl_name, kCtlName, strlen(kCtlName));
+    if (ioctl(fd, CTLIOCGINFO, &info) < 0) {
+        int err = errno;
+        close(fd);
+        fprintf(stderr, "getting kext device id [%s]", strerror(err));
+        return -1;
     }
-    return event;
+    
+    /* (initialize addr here) */
+    struct sockaddr_ctl addr;
+    addr.sc_len = sizeof(struct sockaddr_ctl);
+    addr.sc_family = AF_SYSTEM;
+    addr.ss_sysaddr = SYSPROTO_CONTROL;
+    addr.sc_id = info.ctl_id;     // set to value of ctl_id registered by the NKE in
+    addr.sc_unit = 0; // set to the unit number registered by the NKE
+    
+    int result = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if (result) {
+        fprintf(stderr, "connect failed %d\n", result);
+        close(fd);
+        return -1;
+    }
+    
+    return fd;
 }
 
 #pragma mark - AppDelegate
@@ -100,38 +175,14 @@ CGEventRef keyboardCGEventCallback(CGEventTapProxy proxy,
 
 - (void)_registerGlobalKeyboardEvents
 {
-    [NSEvent addGlobalMonitorForEventsMatchingMask:NSEventMaskKeyDown | NSEventMaskKeyUp handler:^(NSEvent *_Nonnull event) {
-        //NSLog(@"event!!");
-        if (event.keyCode == kVK_F1)
-        {
-            if (event.type == NSEventTypeKeyDown)
-            {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    [self decreaseBrightness];
-                });
-            }
-        }
-        else if (event.keyCode == kVK_F2)
-        {
-            if (event.type == NSEventTypeKeyDown)
-            {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    [self increaseBrightness];
-                });
-            }
-        }
-    }];
-    
     CFRunLoopRef runloop = (CFRunLoopRef)CFRunLoopGetCurrent();
-    CGEventMask interestedEvents = NX_KEYDOWNMASK | NX_KEYUPMASK | NX_FLAGSCHANGEDMASK;
+    CGEventMask interestedEvents = NX_SYSDEFINEDMASK;
     CFMachPortRef eventTap = CGEventTapCreate(kCGAnnotatedSessionEventTap, kCGHeadInsertEventTap,
                                               kCGEventTapOptionDefault, interestedEvents, keyboardCGEventCallback, (__bridge void * _Nullable)(self));
     // by passing self as last argument, you can later send events to this class instance
     
-    CFRunLoopSourceRef source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault,
-                                                              eventTap, 0);
+    CFRunLoopSourceRef source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0);
     CFRunLoopAddSource((CFRunLoopRef)runloop, source, kCFRunLoopCommonModes);
-    
     CGEventTapEnable(eventTap, true);
 }
 
@@ -143,8 +194,8 @@ CGEventRef keyboardCGEventCallback(CGEventTapProxy proxy,
 - (void)_loadBrightness
 {
     [[NSUserDefaults standardUserDefaults] registerDefaults:@{
-        brightnessValuePreferenceKey: @(8*brightnessStep)
-    }];
+                                                              brightnessValuePreferenceKey: @(8*brightnessStep)
+                                                              }];
     
     _brightness = [[NSUserDefaults standardUserDefaults] floatForKey:brightnessValuePreferenceKey];
     NSLog(@"Loaded value: %f",_brightness);
@@ -202,26 +253,29 @@ void shutdownSignalHandler(int signal)
 {
     _brightness = value;
     
-    CGDirectDisplayID display = CGSMainDisplayID();
+    NSLog(@"set brightness: %f", value);
     
-    if (_BSDoGraphicWithMeterAndTimeout != NULL)
+    // Sierra+ visual feedback
+    [[NSClassFromString(@"OSDManager") sharedManager] showImage:OSDGraphicBacklight onDisplayID:CGSMainDisplayID() priority:OSDPriorityDefault msecUntilFade:1000 filledChiclets:value/brightnessStep totalChiclets:100.f/brightnessStep locked:NO];
+    
+    
+    // set the brightness
+    uint32_t normalizedBrightness = (MAX_BRIGHTNESS - MIN_BRIGHTNESS) * value / 100 + MIN_BRIGHTNESS;
+    NSLog(@"brighness: %d", normalizedBrightness);
+    
+    static int fd = -1;
+    if (fd < 0)
+        fd = connectKextSocket();
+    
+    if (fd < 0)
     {
-        // El Capitan and probably older systems
-        _BSDoGraphicWithMeterAndTimeout(display, BSGraphicBacklightMeter, 0x0, value/100.f, 1);
-    }
-    else {
-        // Sierra+
-        [[NSClassFromString(@"OSDManager") sharedManager] showImage:OSDGraphicBacklight onDisplayID:CGSMainDisplayID() priority:OSDPriorityDefault msecUntilFade:1000 filledChiclets:value/brightnessStep totalChiclets:100.f/brightnessStep locked:NO];
+        NSLog(@"Cannot connect to the kext socket");
+        return;
     }
     
-    for (NSScreen *screen in NSScreen.screens) {
-        NSDictionary *description = [screen deviceDescription];
-        if ([description objectForKey:@"NSDeviceIsScreen"]) {
-            CGDirectDisplayID screenNumber = [[description objectForKey:@"NSScreenNumber"] unsignedIntValue];
-            
-            set_control(screenNumber, BRIGHTNESS, value);
-        }
-    }
+    int result = setsockopt(fd, SYSPROTO_CONTROL, kCommandSetBrightness, &normalizedBrightness, sizeof(normalizedBrightness));
+    if (result)
+        NSLog(@"setsockopt failed: %d", result);
 }
 
 - (float)brightness

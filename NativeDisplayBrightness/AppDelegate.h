@@ -10,6 +10,8 @@
 
 @interface AppDelegate : NSObject <NSApplicationDelegate>
 
+- (void)increaseBrightness;
+- (void)decreaseBrightness;
 
 @end
 
