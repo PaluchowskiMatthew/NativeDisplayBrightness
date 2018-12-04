@@ -22,6 +22,11 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 
+// Using system events swallows everything with subtype 8 - including media keys in mojave 10.4.1.
+// It probably is an apple bug as the doc states that as long as we return the same event it will
+// continue to be processed by the system.
+// For brightness only plain f1/f2 are used until this is fixed.
+#define kUseSystemEventTap FALSE
 
 static const int kCommandSetBrightness = 1;
 static const char* kCtlName = "github.com.TankTheFrank.nvdagpuhandler";
@@ -41,10 +46,7 @@ void *(*_BSDoGraphicWithMeterAndTimeout)(CGDirectDisplayID arg0, BSGraphic arg1,
 
 #pragma mark - functions
 
-CGEventRef keyboardCGEventCallback(CGEventTapProxy proxy,
-                                   CGEventType type,
-                                   CGEventRef event,
-                                   void *refcon)
+CGEventRef keyboardCGSystemEventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon)
 {
     if (type != NX_SYSDEFINED)
         return event;
@@ -65,13 +67,13 @@ CGEventRef keyboardCGEventCallback(CGEventTapProxy proxy,
     if (keyState == 0)
         return NULL;
     
-    // we receive twice the same event so we need to check delay so we ignore everything less than 10 ms
+    // we receive multiple times the same event; check the delay to ignore events less than 10 ms apart
     static struct timeval lastEvent = {0, 0};
     struct timeval now;
     gettimeofday(&now, NULL);
     if (now.tv_sec * 1000 + now.tv_usec/1000 - lastEvent.tv_sec * 1000 - lastEvent.tv_usec/1000 < 10)
         return NULL;
-    
+
     lastEvent = now;
     
     // handle the brightness change
@@ -93,6 +95,33 @@ CGEventRef keyboardCGEventCallback(CGEventTapProxy proxy,
     
     return NULL;
 }
+
+CGEventRef keyboardCGKeyboardEventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon)
+{
+    NSLog(@"key down");
+    if (type != NX_KEYDOWN)
+        return event;
+    
+    NSEvent* keyEvent = [NSEvent eventWithCGEvent: event];
+    switch (keyEvent.keyCode)
+    {
+        case kVK_F1:
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [(__bridge AppDelegate*)refcon decreaseBrightness];
+            });
+            break;
+        case kVK_F2:
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [(__bridge AppDelegate*)refcon increaseBrightness];
+            });
+            break;
+        default:
+            return event;
+    }
+    
+    return NULL;
+}
+
 
 
 int connectKextSocket()
@@ -176,14 +205,24 @@ int connectKextSocket()
 - (void)_registerGlobalKeyboardEvents
 {
     CFRunLoopRef runloop = (CFRunLoopRef)CFRunLoopGetCurrent();
-    CGEventMask interestedEvents = NX_SYSDEFINEDMASK;
-    CFMachPortRef eventTap = CGEventTapCreate(kCGAnnotatedSessionEventTap, kCGHeadInsertEventTap,
-                                              kCGEventTapOptionDefault, interestedEvents, keyboardCGEventCallback, (__bridge void * _Nullable)(self));
-    // by passing self as last argument, you can later send events to this class instance
+    CFMachPortRef eventTap;
+    if (kUseSystemEventTap)
+    {
+        eventTap = CGEventTapCreate(kCGAnnotatedSessionEventTap, kCGHeadInsertEventTap,
+                                                  kCGEventTapOptionDefault, NX_SYSDEFINEDMASK, keyboardCGSystemEventCallback, (__bridge void * _Nullable)(self));
+    }
+    else
+    {
+        eventTap = CGEventTapCreate(kCGAnnotatedSessionEventTap, kCGHeadInsertEventTap,
+                                                  kCGEventTapOptionDefault, NX_KEYDOWNMASK, keyboardCGKeyboardEventCallback, (__bridge void * _Nullable)(self));
+    }
     
     CFRunLoopSourceRef source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0);
     CFRunLoopAddSource((CFRunLoopRef)runloop, source, kCFRunLoopCommonModes);
     CGEventTapEnable(eventTap, true);
+    
+    CFRelease(eventTap);
+    CFRelease(source);
 }
 
 - (void)_saveBrightness
